@@ -1,0 +1,8 @@
+# 绝不提交任何含订阅链接/密钥的文件
+config.yaml
+*.local.yaml
+*.bak
+*.bak.*
+.DS_Store
+__pycache__/
+*.pyc

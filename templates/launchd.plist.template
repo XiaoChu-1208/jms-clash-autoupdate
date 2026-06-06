@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>__BIN__/jms-verge-update</string>
+    </array>
+
+    <!-- 定时跑（秒）。脚本无变化时是空跑、不写盘，故可高频。 -->
+    <key>StartInterval</key>
+    <integer>__INTERVAL__</integer>
+
+    <!-- 加载时（登录/开机）也跑一次 -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/jms-verge-update.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/jms-verge-update.log</string>
+</dict>
+</plist>

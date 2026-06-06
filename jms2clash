@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+jms2clash —— 把 JustMySocks / 通用机场订阅链接转换成 Clash YAML 配置。
+
+支持节点类型：ss://（Shadowsocks）、vmess://（V2Ray）。
+初次配置 / 推倒重建用它；日常增量同步用 jms-verge-update。
+
+配置：~/.config/jms-clash-autoupdate/config.yaml（见仓库 config.example.yaml）。
+  sub_url          订阅链接（CLI 参数 > 环境变量 JMS_SUB_URL > 配置）
+  node_key_pattern 节点稳定标识正则（默认 c70s\\d+）
+  names            {标识: 友好名} 映射
+
+用法：
+  jms2clash                       # 用配置里的订阅，输出到 ~/Desktop/jms.yaml
+  jms2clash <订阅链接>            # 指定订阅链接
+  jms2clash <订阅链接> <输出路径>  # 指定链接 + 输出文件
+  jms2clash -o /path/out.yaml     # 只改输出路径
+  cat sub.txt | jms2clash -       # 用 - 从 stdin 读订阅原文（base64 或明文链接）
+"""
+
+import sys
+import os
+import re
+import json
+import base64
+import argparse
+import urllib.request
+from urllib.parse import unquote
+
+DEFAULT_OUT = os.path.expanduser("~/Desktop/jms.yaml")
+CONFIG_PATHS = [
+    os.environ.get("JMS_CLASH_CONFIG", ""),
+    os.path.expanduser("~/.config/jms-clash-autoupdate/config.yaml"),
+]
+
+
+def load_user_config() -> dict:
+    """读 config.yaml（可选）。没有 PyYAML 也不报错，配置文件功能降级关闭。"""
+    try:
+        import yaml
+    except ImportError:
+        return {}
+    for p in CONFIG_PATHS:
+        if p and os.path.exists(p):
+            try:
+                return yaml.safe_load(open(p, encoding="utf-8")) or {}
+            except Exception as e:
+                sys.stderr.write(f"  ! 读配置失败 {p}: {e}\n")
+    return {}
+
+
+USER_CFG = load_user_config()
+NODE_KEY_RE = re.compile(str(USER_CFG.get("node_key_pattern") or r"c70s\d+"), re.IGNORECASE)
+NAME_MAP = {str(k).lower(): v for k, v in (USER_CFG.get("names") or {}).items()}
+
+
+def apply_friendly_name(p: dict) -> dict:
+    """把节点名换成规范友好名（按标识对齐）；表里没有的节点保留订阅原名。"""
+    m = NODE_KEY_RE.search(p.get("name", "") or "") or NODE_KEY_RE.search(p.get("server", "") or "")
+    if m and m.group(0).lower() in NAME_MAP:
+        p["name"] = NAME_MAP[m.group(0).lower()]
+    return p
+
+
+def b64decode(s: str) -> bytes:
+    """容错的 base64 解码：补 padding，兼容 url-safe。"""
+    s = s.strip().replace("-", "+").replace("_", "/")
+    s += "=" * (-len(s) % 4)
+    return base64.b64decode(s)
+
+
+def fetch(url: str) -> str:
+    if url == "-":
+        return sys.stdin.read()
+    # 强制直连绕开 HTTP(S)_PROXY/ALL_PROXY：订阅在 CDN 上本就可直连，
+    # 而代理常在重建时已死，走死代理拉订阅会 TLS 握手 EOF。
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "clash-verge/1.0 jms2clash"}
+    )
+    with opener.open(req, timeout=30) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def decode_subscription(raw: str) -> list:
+    """订阅原文 -> 节点链接行列表。机场订阅整体是 base64，里面每行一个链接。"""
+    raw = raw.strip()
+    try:
+        decoded = b64decode(raw).decode("utf-8", "replace")
+        if "://" in decoded:
+            raw = decoded
+    except Exception:
+        pass
+    return [ln.strip() for ln in raw.splitlines() if "://" in ln]
+
+
+def parse_ss(link: str) -> dict:
+    """ss://base64(method:password)@host:port#name 或 ss://base64(method:pwd@host:port)#name"""
+    body = link[len("ss://"):]
+    name = ""
+    if "#" in body:
+        body, name = body.split("#", 1)
+        name = unquote(name)
+    if "?" in body:
+        body = body.split("?", 1)[0]
+
+    if "@" in body:
+        userinfo, hostpart = body.rsplit("@", 1)
+        try:
+            method, password = b64decode(userinfo).decode("utf-8").split(":", 1)
+        except Exception:
+            method, password = unquote(userinfo).split(":", 1)
+        host, port = hostpart.rsplit(":", 1)
+    else:
+        plain = b64decode(body).decode("utf-8")
+        creds, hostpart = plain.rsplit("@", 1)
+        method, password = creds.split(":", 1)
+        host, port = hostpart.rsplit(":", 1)
+
+    return {
+        "name": name or f"{host}:{port}",
+        "type": "ss",
+        "server": host,
+        "port": int(port),
+        "cipher": method,
+        "password": password,
+        "udp": True,
+    }
+
+
+def parse_vmess(link: str) -> dict:
+    """vmess://base64(json)"""
+    cfg = json.loads(b64decode(link[len("vmess://"):]).decode("utf-8"))
+    proxy = {
+        "name": cfg.get("ps") or f'{cfg.get("add")}:{cfg.get("port")}',
+        "type": "vmess",
+        "server": cfg.get("add"),
+        "port": int(cfg.get("port", 0)),
+        "uuid": cfg.get("id"),
+        "alterId": int(cfg.get("aid", 0) or 0),
+        "cipher": cfg.get("scy") or "auto",
+        "udp": True,
+    }
+    net = cfg.get("net", "tcp")
+    if net and net != "tcp":
+        proxy["network"] = net
+    if str(cfg.get("tls", "")).lower() in ("tls", "1", "true"):
+        proxy["tls"] = True
+        if cfg.get("sni") or cfg.get("host"):
+            proxy["servername"] = cfg.get("sni") or cfg.get("host")
+    if net == "ws":
+        ws = {}
+        if cfg.get("path"):
+            ws["path"] = cfg["path"]
+        if cfg.get("host"):
+            ws["headers"] = {"Host": cfg["host"]}
+        if ws:
+            proxy["ws-opts"] = ws
+    return proxy
+
+
+def parse_link(link: str):
+    try:
+        if link.startswith("ss://"):
+            return parse_ss(link)
+        if link.startswith("vmess://"):
+            return parse_vmess(link)
+    except Exception as e:
+        sys.stderr.write(f"  ! 跳过无法解析的节点: {link[:40]}... ({e})\n")
+    return None
+
+
+# ---------- 极简 YAML 输出（避免依赖 PyYAML）----------
+
+def yq(v: str) -> str:
+    """给字符串值加引号并转义，保证 YAML 安全。"""
+    s = str(v)
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def proxy_to_yaml(p: dict) -> str:
+    parts = []
+    for k, v in p.items():
+        if isinstance(v, bool):
+            parts.append(f"{k}: {'true' if v else 'false'}")
+        elif isinstance(v, int):
+            parts.append(f"{k}: {v}")
+        elif isinstance(v, dict):
+            inner = ", ".join(
+                f"{ik}: {{{', '.join(f'{hk}: {yq(hv)}' for hk, hv in iv.items())}}}"
+                if isinstance(iv, dict) else f"{ik}: {yq(iv)}"
+                for ik, iv in v.items()
+            )
+            parts.append(f"{k}: {{{inner}}}")
+        else:
+            parts.append(f"{k}: {yq(v)}")
+    return "{" + ", ".join(parts) + "}"
+
+
+def build_yaml(proxies: list) -> str:
+    names = [p["name"] for p in proxies]
+    L = []
+    L.append("# 由 jms2clash 自动生成")
+    L.append("mixed-port: 7890")
+    L.append("allow-lan: false")
+    L.append("mode: rule")
+    L.append("log-level: info")
+    L.append("ipv6: false")
+    L.append("external-controller: 127.0.0.1:9090")
+    L.append("dns:")
+    L.append("  enable: true")
+    L.append("  nameserver: [223.5.5.5, 119.29.29.29]")
+    L.append("  fallback: [8.8.8.8, 1.1.1.1]")
+    L.append("")
+    L.append("proxies:")
+    for p in proxies:
+        L.append("  - " + proxy_to_yaml(p))
+    L.append("")
+    L.append("proxy-groups:")
+    L.append("  - name: 节点选择")
+    L.append("    type: select")
+    L.append("    proxies:")
+    L.append("      - 自动选最快")
+    for n in names:
+        L.append(f"      - {yq(n)}")
+    L.append("  - name: 自动选最快")
+    L.append("    type: url-test")
+    L.append("    url: http://www.gstatic.com/generate_204")
+    L.append("    interval: 300")
+    L.append("    tolerance: 50")
+    L.append("    proxies:")
+    for n in names:
+        L.append(f"      - {yq(n)}")
+    L.append("  - name: 其余流量兜底")
+    L.append("    type: select")
+    L.append("    proxies:")
+    L.append("      - 节点选择")
+    L.append("      - DIRECT")
+    L.append("")
+    L.append("rules:")
+    L.append("  - GEOIP,CN,DIRECT")
+    L.append("  - MATCH,其余流量兜底")
+    L.append("")
+    return "\n".join(L)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="把订阅链接转换成 Clash YAML 配置",
+        add_help=True,
+    )
+    ap.add_argument("sub", nargs="?", default=None,
+                    help="订阅链接，或用 - 从 stdin 读（默认读配置/环境变量）")
+    ap.add_argument("out", nargs="?", default=None, help="输出 YAML 路径")
+    ap.add_argument("-o", "--output", default=None, help="输出 YAML 路径")
+    args = ap.parse_args()
+
+    sub = args.sub or os.environ.get("JMS_SUB_URL") or USER_CFG.get("sub_url")
+    if not sub:
+        sys.stderr.write(
+            "✗ 没有订阅链接。请在 ~/.config/jms-clash-autoupdate/config.yaml 里设置 sub_url，"
+            "或 `jms2clash <订阅链接>`，或导出环境变量 JMS_SUB_URL。\n"
+        )
+        sys.exit(1)
+
+    out_path = os.path.expanduser(args.output or args.out or DEFAULT_OUT)
+
+    sys.stderr.write(f"→ 拉取订阅: {sub if sub != '-' else '<stdin>'}\n")
+    raw = fetch(sub)
+    links = decode_subscription(raw)
+    sys.stderr.write(f"→ 解析到 {len(links)} 条节点链接\n")
+
+    proxies = [apply_friendly_name(p) for p in (parse_link(l) for l in links) if p]
+    if not proxies:
+        sys.stderr.write("✗ 没有解析出任何可用节点，退出。\n")
+        sys.exit(1)
+
+    yaml_text = build_yaml(proxies)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(yaml_text)
+
+    sys.stderr.write(f"✓ 已生成 {len(proxies)} 个节点 -> {out_path}\n")
+    for p in proxies:
+        sys.stderr.write(f"    [{p['type']:5}] {p['name']}\n")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+jms-verge-update —— 结构化同步 Clash Verge (Rev) 正在用的机场节点。
+
+为什么不是「只换 IP」：机场订阅会做三件「只换 IP 的脚本」搞不定的事——
+  1) 在 SS ↔ VMess 之间切换某个节点的协议（cipher/uuid 整套都变，光换 server 会得到死节点）；
+  2) 下架某个节点；
+  3) 加回 / 新增节点。
+所以本脚本按「节点稳定标识」（默认正则 c70sN，可在配置里改）对齐后，**整条节点按订阅重建**（协议正确），
+并把分组成员、运行时配置、profiles.yaml 的选中项一起同步；
+而你手工配的分组结构 / 规则 / DNS 一律原样保留（只换其中的节点成员）。
+改前所有被动文件都备份 *.bak，最后走 mihomo 的 unix socket 热重载，立即生效。
+
+配置：~/.config/jms-clash-autoupdate/config.yaml（见仓库 config.example.yaml）。
+  sub_url          必填，你的订阅链接
+  node_key_pattern 选填，节点稳定标识正则（默认 c70s\\d+）
+  names            选填，{标识: 友好名} 映射
+  only_locations   选填，只保留显示名含这些关键词的节点（留空=全保留）
+
+用法：
+  jms-verge-update            # 用配置里的订阅，自动找当前 profile，同步并热重载
+  jms-verge-update <订阅链接>  # 临时覆盖订阅
+  jms-verge-update --dry-run  # 只看会改什么，不落盘、不重载
+"""
+from __future__ import annotations  # 让 str|None 等注解在 py3.7+ 都不报错
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
+import sys
+import os
+import re
+import json
+import base64
+import shutil
+import socket
+import time
+import argparse
+import urllib.request
+import urllib.parse
+
+try:
+    import yaml  # macOS 自带 /usr/bin/python3 也内置 PyYAML 6.x
+except ImportError:
+    sys.stderr.write(
+        "✗ 缺少 PyYAML。请用自带它的解释器（如 macOS 的 /usr/bin/python3），"
+        "或 `python3 -m pip install --user pyyaml`。\n"
+    )
+    sys.exit(1)
+
+# Clash Verge Rev 的数据目录（macOS 默认）
+VERGE_DIR = os.path.expanduser(
+    "~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
+)
+RUNTIME = os.path.join(VERGE_DIR, "clash-verge.yaml")
+PROFILES_INDEX = os.path.join(VERGE_DIR, "profiles.yaml")
+CONFIG = os.path.join(VERGE_DIR, "config.yaml")
+LOG = os.path.expanduser("~/Library/Logs/jms-verge-update.log")
+
+CONFIG_PATHS = [
+    os.environ.get("JMS_CLASH_CONFIG", ""),
+    os.path.expanduser("~/.config/jms-clash-autoupdate/config.yaml"),
+]
+
+
+def log(msg: str):
+    line = msg.rstrip("\n")
+    sys.stderr.write(line + "\n")
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def load_user_config() -> dict:
+    for p in CONFIG_PATHS:
+        if p and os.path.exists(p):
+            try:
+                return yaml.safe_load(open(p, encoding="utf-8")) or {}
+            except Exception as e:
+                log(f"  ! 读配置失败 {p}: {e}")
+    return {}
+
+
+USER_CFG = load_user_config()
+# 节点稳定标识：机场节点名 / 地址里一般带 c70s1 / c70s2 / c70s801 这样的串。
+NODE_KEY_RE = re.compile(str(USER_CFG.get("node_key_pattern") or r"c70s\d+"), re.IGNORECASE)
+# 规范友好名：{标识(小写): 显示名}。键末尾通常带「· 标识」承重串，本脚本靠它在节点名里对齐。
+NAME_MAP = {str(k).lower(): v for k, v in (USER_CFG.get("names") or {}).items()}
+# 只保留显示名含这些关键词的节点（留空 = 全保留）。
+ONLY_LOCATIONS = tuple(USER_CFG.get("only_locations") or ())
+ALLOWED_KEYS = (
+    {k for k, v in NAME_MAP.items() if any(loc in str(v) for loc in ONLY_LOCATIONS)}
+    if ONLY_LOCATIONS else set()
+)
+
+
+def b64decode(s: str) -> bytes:
+    s = s.strip().replace("-", "+").replace("_", "/")
+    s += "=" * (-len(s) % 4)
+    return base64.b64decode(s)
+
+
+def fetch(url: str) -> str:
+    # 关键：强制直连、绕开任何 HTTP(S)_PROXY/ALL_PROXY 环境变量。
+    # 否则会被塞进 Clash 代理里——而本脚本恰恰是在代理节点死掉时跑的，
+    # 走死代理拉订阅必然 TLS 握手 EOF，形成「救不活自己」的死循环。
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    req = urllib.request.Request(url, headers={"User-Agent": "clash-verge/1.0"})
+    last = None
+    for attempt in range(1, 4):  # 无人值守：网络抽风时重试 3 次，别一次失败就空等
+        try:
+            with opener.open(req, timeout=30) as r:
+                return r.read().decode("utf-8", "replace")
+        except Exception as e:
+            last = e
+            log(f"  ! 拉订阅失败（第 {attempt}/3 次）: {type(e).__name__}: {e}")
+            time.sleep(3 * attempt)
+    raise last
+
+
+def node_key(text):
+    m = NODE_KEY_RE.search(text or "")
+    return m.group(0).lower() if m else None
+
+
+def node_num(key: str) -> int:
+    m = re.search(r"(\d+)$", key or "")
+    return int(m.group(1)) if m else 0
+
+
+# ---------- 订阅 → 完整节点字典（协议正确）----------
+
+def parse_ss(link: str) -> dict:
+    """ss://base64(method:password)@host:port#name 或 ss://base64(method:pwd@host:port)#name"""
+    body = link[len("ss://"):]
+    name = ""
+    if "#" in body:
+        body, name = body.split("#", 1)
+        name = urllib.parse.unquote(name)
+    if "?" in body:
+        body = body.split("?", 1)[0]
+    if "@" in body:
+        userinfo, hostpart = body.rsplit("@", 1)
+        try:
+            method, password = b64decode(userinfo).decode("utf-8").split(":", 1)
+        except Exception:
+            method, password = urllib.parse.unquote(userinfo).split(":", 1)
+        host, port = hostpart.rsplit(":", 1)
+    else:
+        plain = b64decode(body).decode("utf-8")
+        creds, hostpart = plain.rsplit("@", 1)
+        method, password = creds.split(":", 1)
+        host, port = hostpart.rsplit(":", 1)
+    return {
+        "name": name or f"{host}:{port}",
+        "type": "ss",
+        "server": host,
+        "port": int(port),
+        "cipher": method,
+        "password": password,
+        "udp": True,
+    }
+
+
+def parse_vmess(link: str) -> dict:
+    """vmess://base64(json)"""
+    cfg = json.loads(b64decode(link[len("vmess://"):]).decode("utf-8"))
+    proxy = {
+        "name": cfg.get("ps") or f'{cfg.get("add")}:{cfg.get("port")}',
+        "type": "vmess",
+        "server": cfg.get("add"),
+        "port": int(cfg.get("port", 0)),
+        "uuid": cfg.get("id"),
+        "alterId": int(cfg.get("aid", 0) or 0),
+        "cipher": cfg.get("scy") or "auto",
+        "udp": True,
+    }
+    net = cfg.get("net", "tcp")
+    if net and net != "tcp":
+        proxy["network"] = net
+    if str(cfg.get("tls", "")).lower() in ("tls", "1", "true"):
+        proxy["tls"] = True
+        if cfg.get("sni") or cfg.get("host"):
+            proxy["servername"] = cfg.get("sni") or cfg.get("host")
+    if net == "ws":
+        ws = {}
+        if cfg.get("path"):
+            ws["path"] = cfg["path"]
+        if cfg.get("host"):
+            ws["headers"] = {"Host": cfg["host"]}
+        if ws:
+            proxy["ws-opts"] = ws
+    return proxy
+
+
+def parse_link(link: str):
+    try:
+        if link.startswith("ss://"):
+            return parse_ss(link)
+        if link.startswith("vmess://"):
+            return parse_vmess(link)
+    except Exception as e:
+        log(f"  ! 跳过无法解析的节点: {link[:40]}... ({e})")
+    return None
+
+
+def sub_to_nodes(raw: str) -> dict:
+    """订阅原文 -> {标识: 完整 proxy 字典}，按标识编号排序。"""
+    raw = raw.strip()
+    try:
+        dec = b64decode(raw).decode("utf-8", "replace")
+        if "://" in dec:
+            raw = dec
+    except Exception:
+        pass
+    nodes = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if "://" not in line:
+            continue
+        p = parse_link(line)
+        if not p:
+            continue
+        key = node_key(p.get("name")) or node_key(p.get("server"))
+        if key:
+            nodes[key] = p
+    return dict(sorted(nodes.items(), key=lambda kv: node_num(kv[0])))
+
+
+# ---------- 节点名取舍 ----------
+
+def is_raw_name(n) -> bool:
+    """订阅默认名 / 没起过名 都算「原始名」，可被规范友好名覆盖。"""
+    if not n:
+        return True
+    if n.startswith("JMS-"):
+        return True
+    if "portablesubmarines" in n:
+        return True
+    if re.match(r"^[0-9A-Za-z.\-]+:\d+$", n):  # host:port 形式
+        return True
+    return False
+
+
+def pick_name(key: str, existing, sub_name) -> str:
+    # 用户已自定义（非原始名）→ 尊重，不动。
+    if existing and not is_raw_name(existing):
+        return existing
+    # 否则套用规范友好名。
+    if key in NAME_MAP:
+        return NAME_MAP[key]
+    # 兜底：未知新节点用订阅原名。
+    return existing or sub_name or key
+
+
+# ---------- 分组成员对齐 ----------
+
+def reconcile_group(members, new_names):
+    """把分组里旧的节点名占位整体换成 new_names；非节点成员（其它分组名 / DIRECT 等）原样保留位置。"""
+    if not isinstance(members, list):
+        return members
+    out, inserted = [], False
+    for m in members:
+        if isinstance(m, str) and node_key(m):  # 是节点占位
+            if not inserted:
+                out.extend(new_names)
+                inserted = True
+            # 旧节点名丢弃（已被 new_names 取代）
+        else:
+            out.append(m)
+    return out
+
+
+def sync_config(data: dict, new_proxies: list, new_names: list):
+    """就地把一份 Clash 配置（profile 或 runtime）的 proxies + 分组成员同步到最新。"""
+    data["proxies"] = [dict(p) for p in new_proxies]
+    for g in data.get("proxy-groups") or []:
+        if isinstance(g, dict) and "proxies" in g:
+            g["proxies"] = reconcile_group(g.get("proxies"), new_names)
+
+
+# ---------- Clash Verge 索引 / 控制 ----------
+
+def current_uid_and_profile():
+    try:
+        idx = yaml.safe_load(open(PROFILES_INDEX, encoding="utf-8"))
+    except Exception:
+        return None, None
+    uid = (idx or {}).get("current")
+    if not uid:
+        return None, None
+    for it in (idx.get("items") or []):
+        if it.get("uid") == uid and it.get("file"):
+            return uid, os.path.join(VERGE_DIR, "profiles", it["file"])
+    return uid, None
+
+
+def update_selected(uid: str, name_remap: dict, dry: bool) -> int:
+    """profiles.yaml 里某 profile 的 selected[].now 若指向被改名 / 下架的节点，跟着改，避免选中项悬空。"""
+    try:
+        idx = yaml.safe_load(open(PROFILES_INDEX, encoding="utf-8"))
+    except Exception:
+        return 0
+    changed = 0
+    for it in (idx.get("items") or []):
+        if it.get("uid") != uid:
+            continue
+        for sel in (it.get("selected") or []):
+            now = sel.get("now")
+            if now in name_remap and name_remap[now] != now:
+                if not dry:
+                    sel["now"] = name_remap[now]
+                changed += 1
+    if changed and not dry:
+        shutil.copy2(PROFILES_INDEX, PROFILES_INDEX + ".bak")
+        dump_yaml(idx, PROFILES_INDEX)
+    return changed
+
+
+def read_config_ctrl():
+    sock, secret = "/tmp/verge/verge-mihomo.sock", ""
+    try:
+        txt = open(CONFIG, encoding="utf-8").read()
+        m = re.search(r"external-controller-unix:\s*(\S+)", txt)
+        if m:
+            sock = m.group(1)
+        m = re.search(r"^secret:\s*(\S+)", txt, re.M)
+        if m:
+            secret = m.group(1).strip().strip('"')
+    except Exception:
+        pass
+    return sock, secret
+
+
+def mihomo_reload(sock_path: str, secret: str, cfg_path: str) -> bool:
+    body = json.dumps({"path": cfg_path}).encode()
+    req = (
+        f"PUT /configs?force=true HTTP/1.1\r\n"
+        f"Host: localhost\r\n"
+        f"Authorization: Bearer {secret}\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"Connection: close\r\n\r\n"
+    ).encode() + body
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(8)
+        s.connect(sock_path)
+        s.sendall(req)
+        resp = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+        s.close()
+        first = resp.split(b"\r\n", 1)[0].decode("latin1")
+        ok = " 204 " in first or " 200 " in first
+        log(f"  → 热重载响应: {first}")
+        return ok
+    except Exception as e:
+        log(f"  ! 热重载失败: {e}")
+        return False
+
+
+def dump_yaml(data: dict, path: str):
+    text = yaml.safe_dump(
+        data, allow_unicode=True, sort_keys=False, default_flow_style=False, width=4096
+    )
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def write_config(path: str, new_proxies: list, new_names: list, dry: bool) -> bool:
+    try:
+        data = yaml.safe_load(open(path, encoding="utf-8"))
+    except Exception as e:
+        log(f"  ! 读不到/解析失败 {os.path.basename(path)}: {e}")
+        return False
+    if not isinstance(data, dict):
+        log(f"  ! {os.path.basename(path)} 不是有效的 Clash 配置，跳过")
+        return False
+    sync_config(data, new_proxies, new_names)
+    if not dry:
+        shutil.copy2(path, path + ".bak")
+        dump_yaml(data, path)
+    return True
+
+
+# ---------- 差异报告 ----------
+
+PROTO_CN = {"ss": "SS", "vmess": "VMess", "trojan": "Trojan"}
+
+
+def report_diff(old_nodes: dict, new_nodes: dict):
+    """返回 (有无实质变化, 变化条数)；同时打印对照表。"""
+    keys = sorted(set(old_nodes) | set(new_nodes), key=node_num)
+    rows = []
+    changed = 0
+    for k in keys:
+        o, n = old_nodes.get(k), new_nodes.get(k)
+        op = PROTO_CN.get((o or {}).get("type"), (o or {}).get("type") or "—")
+        np = PROTO_CN.get((n or {}).get("type"), (n or {}).get("type") or "—")
+        oip = (o or {}).get("server", "—")
+        nip = (n or {}).get("server", "—")
+        if o and not n:
+            status, mark = "已下架", "✗"
+            changed += 1
+        elif n and not o:
+            status, mark = "新增", "＋"
+            changed += 1
+        elif op != np:
+            status, mark = f"协议变({op}→{np})", "✎"
+            changed += 1
+        elif oip != nip:
+            status, mark = "换 IP", "✎"
+            changed += 1
+        else:
+            status, mark = "未变", "="
+        proto = np if n else op
+        rows.append((mark, k, proto, oip, nip, status))
+    w_key = max((len(r[1]) for r in rows), default=6)
+    log(f"  {'':1} {'节点':<{w_key}}  {'协议':<6} {'旧 IP':<16} {'新 IP':<16} 状态")
+    for mark, k, proto, oip, nip, status in rows:
+        log(f"  {mark} {k:<{w_key}}  {proto:<6} {oip:<16} {nip:<16} {status}")
+    return changed > 0, changed
+
+
+# ---------- 主流程 ----------
+
+def main():
+    ap = argparse.ArgumentParser(description="结构化同步 Clash Verge 的机场节点")
+    ap.add_argument("sub", nargs="?", default=None, help="订阅链接（默认读配置/环境变量）")
+    ap.add_argument("--dry-run", action="store_true", help="只预览，不落盘不重载")
+    args = ap.parse_args()
+
+    sub = args.sub or os.environ.get("JMS_SUB_URL") or USER_CFG.get("sub_url")
+    if not sub:
+        log("✗ 没有订阅链接。请在 ~/.config/jms-clash-autoupdate/config.yaml 里设置 sub_url，"
+            "或 `jms-verge-update <订阅链接>`，或导出环境变量 JMS_SUB_URL。")
+        sys.exit(1)
+
+    log("=" * 56)
+    log("→ 开始同步机场节点")
+
+    uid, profile = current_uid_and_profile()
+    if not profile or not os.path.exists(profile):
+        log(f"✗ 找不到当前 profile 文件 (uid={uid}, file={profile})。"
+            "请先在 Clash Verge 里导入并选中一个 profile（可用 jms2clash 生成）。")
+        sys.exit(1)
+    log(f"  当前 profile: {os.path.basename(profile)} (uid={uid})")
+
+    raw = fetch(sub)
+    sub_nodes = sub_to_nodes(raw)
+    # 只留指定地区：把订阅里非白名单节点剔除，下游会自动把它们当「已下架」清出配置。
+    if ALLOWED_KEYS:
+        dropped = [k for k in sub_nodes if k not in ALLOWED_KEYS]
+        sub_nodes = {k: v for k, v in sub_nodes.items() if k in ALLOWED_KEYS}
+        if dropped:
+            log(f"  · only_locations 生效，过滤掉非目标地区节点: {', '.join(dropped)}")
+    if not sub_nodes:
+        log("✗ 订阅没解析出任何（符合条件的）节点，放弃（不动现有配置）。")
+        sys.exit(1)
+
+    # 读当前 profile 的旧节点
+    try:
+        prof = yaml.safe_load(open(profile, encoding="utf-8"))
+    except Exception as e:
+        log(f"✗ 解析当前 profile 失败: {e}")
+        sys.exit(1)
+    old_nodes = {}
+    for p in (prof.get("proxies") or []):
+        k = node_key(p.get("name")) or node_key(p.get("server"))
+        if k:
+            old_nodes[k] = p
+
+    # 决定每个节点的最终显示名（套用规范友好名 / 尊重已自定义名）
+    name_remap = {}   # 旧节点名 -> 新节点名（给 profiles.yaml 选中项用）
+    name_changed = 0
+    for k, p in sub_nodes.items():
+        old_name = (old_nodes.get(k) or {}).get("name")
+        new_name = pick_name(k, old_name, p.get("name"))
+        p["name"] = new_name
+        if old_name and old_name != new_name:
+            name_remap[old_name] = new_name
+            name_changed += 1
+    # 下架的节点：选中项回落到第一个新节点
+    new_proxies = list(sub_nodes.values())
+    new_names = [p["name"] for p in new_proxies]
+    for k, p in old_nodes.items():
+        if k not in sub_nodes and p.get("name") and new_names:
+            name_remap[p["name"]] = new_names[0]
+
+    # 对照表
+    structural_changed, n_changed = report_diff(old_nodes, sub_nodes)
+    if name_changed:
+        log(f"  ✎ 另有 {name_changed} 个节点套用规范名（如 {next(iter(name_remap))} → {name_remap[next(iter(name_remap))]}）")
+
+    if not structural_changed and not name_changed:
+        log("✓ 节点、协议、IP、名称都已是最新，无需改动。")
+        return
+
+    if args.dry_run:
+        log(f"(dry-run) 将同步 {len(new_proxies)} 个节点（变动 {n_changed} 处 + 改名 {name_changed} 处），未落盘。")
+        return
+
+    # 落盘：profile + 运行时 + 选中项
+    ok_prof = write_config(profile, new_proxies, new_names, dry=False)
+    ok_rt = write_config(RUNTIME, new_proxies, new_names, dry=False)
+    n_sel = update_selected(uid, name_remap, dry=False)
+    log(f"  已同步 profile({'ok' if ok_prof else '失败'}) + 运行时({'ok' if ok_rt else '失败'}) + 选中项({n_sel} 处)，原文件已备份 *.bak")
+
+    # 热重载
+    sock, secret = read_config_ctrl()
+    if mihomo_reload(sock, secret, RUNTIME):
+        log(f"✓ 完成：{len(new_proxies)} 个节点已同步并热重载生效。")
+    else:
+        log("⚠ 文件已更新，但热重载未确认成功；下次 Clash Verge 重新加载该配置时也会生效。")
+
+
+if __name__ == "__main__":
+    main()

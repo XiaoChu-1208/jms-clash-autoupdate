@@ -1,0 +1,7 @@
+#!/bin/sh
+# 由 sleepwatcher 在每次唤醒（开盖 / 从睡眠恢复）时调用。
+# 作用：合盖期间 launchd 的定时器被挂起，开盖后这里立刻补刷一次节点，
+# 保证刚醒来就拿到最新 IP / 协议，不用等下一个定时周期。
+# 先睡 8 秒给 Wi-Fi 重连留时间（脚本自身还会重试 3 次拉订阅，双保险）。
+sleep 8
+/usr/bin/python3 __BIN__/jms-verge-update >> __HOME__/Library/Logs/jms-verge-update.log 2>&1
