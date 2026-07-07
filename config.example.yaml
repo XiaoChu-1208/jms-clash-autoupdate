@@ -25,3 +25,13 @@ names: {}
 # 用于固定只走某地区出口、保持出口 IP 纯净。需要配合上面 names 使用。
 only_locations: []
 #  - "洛杉矶"
+
+# 域名优先：不少机场（含 JustMySocks）的节点名里带一个稳定域名
+# （如 JMS-...@c70s1.example.com:7929），而 server 字段是会轮换的裸 IP。
+# 开启后用域名当 server，IP 轮换由 DNS 解析兜住，配置不再因换 IP 而过期。
+# 节点名里没有域名时此选项无效果，所以默认开着也安全。
+prefer_domain: true
+
+# 更新自检地址：jms-verge-update 真正落盘前后各经本机 Clash 混合端口访问一次这个地址；
+# 「更新前是通的、更新后不通」会自动回滚本次改动，绝不把可用状态改坏。
+probe_url: "https://www.google.com/generate_204"

@@ -53,6 +53,18 @@ def load_user_config() -> dict:
 USER_CFG = load_user_config()
 NODE_KEY_RE = re.compile(str(USER_CFG.get("node_key_pattern") or r"c70s\d+"), re.IGNORECASE)
 NAME_MAP = {str(k).lower(): v for k, v in (USER_CFG.get("names") or {}).items()}
+# 节点名里带稳定域名时用域名当 server（IP 轮换交给 DNS 解析，配置不过期）。
+PREFER_DOMAIN = bool(USER_CFG.get("prefer_domain", True))
+# 匹配节点名末尾的「@域名:端口」；正则要求 TLD 是字母，裸 IP 不会误匹配。
+DOMAIN_IN_NAME_RE = re.compile(r"@([A-Za-z0-9.-]+\.[A-Za-z]{2,}):\d+\s*$")
+
+
+def prefer_domain(p: dict) -> dict:
+    """节点名里带稳定域名时，用它覆盖 server 字段里会轮换的裸 IP。"""
+    m = DOMAIN_IN_NAME_RE.search(p.get("name", "") or "")
+    if m:
+        p["server"] = m.group(1)
+    return p
 
 
 def apply_friendly_name(p: dict) -> dict:
@@ -271,7 +283,10 @@ def main():
     links = decode_subscription(raw)
     sys.stderr.write(f"→ 解析到 {len(links)} 条节点链接\n")
 
-    proxies = [apply_friendly_name(p) for p in (parse_link(l) for l in links) if p]
+    proxies = [
+        apply_friendly_name(prefer_domain(p) if PREFER_DOMAIN else p)
+        for p in (parse_link(l) for l in links) if p
+    ]
     if not proxies:
         sys.stderr.write("✗ 没有解析出任何可用节点，退出。\n")
         sys.exit(1)
