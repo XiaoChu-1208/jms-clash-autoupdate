@@ -239,7 +239,7 @@ def build_yaml(proxies: list) -> str:
     L.append("  - name: 自动选最快")
     L.append("    type: url-test")
     L.append("    url: http://www.gstatic.com/generate_204")
-    L.append("    interval: 300")
+    L.append("    interval: 60  # 节点被墙后最多 60s 自愈；300 时故障窗口长达 5 分钟")
     L.append("    tolerance: 50")
     L.append("    proxies:")
     for n in names:

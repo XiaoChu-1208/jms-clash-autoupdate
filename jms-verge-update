@@ -73,13 +73,16 @@ CONFIG_PATHS = [
 
 def log(msg: str):
     line = msg.rstrip("\n")
-    sys.stderr.write(line + "\n")
+    # 先落日志文件；仅交互终端（tty）才回显 stderr。
+    # launchd 下 stderr 被重定向进同一日志文件，写两遍会出现「双写」。
     try:
         os.makedirs(os.path.dirname(LOG), exist_ok=True)
         with open(LOG, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
         pass
+    if sys.stderr.isatty():
+        sys.stderr.write(line + "\n")
 
 
 def load_user_config() -> dict:
